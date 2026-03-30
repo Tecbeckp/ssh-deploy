@@ -1,0 +1,37 @@
+# ============================================================
+#  Sample GitHub Actions workflow using Tecbeckp/ssh-deploy
+#  Place this file at: .github/workflows/deploy.yml
+# ============================================================
+
+name: Deploy via SSH
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: Tecbeckp/ssh-deploy@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          server-dir: /var/www/html/my-app/
+
+# ============================================================
+#  REQUIRED SECRETS (GitHub repo -> Settings -> Secrets):
+#
+#    SSH_HOST          Your server IP or hostname
+#    SSH_USERNAME      SSH user (e.g., root, deploy, ubuntu)
+#    SSH_PRIVATE_KEY   Full SSH private key content
+#                      Generate with: ssh-keygen -t ed25519
+# ============================================================

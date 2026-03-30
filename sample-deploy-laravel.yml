@@ -1,0 +1,45 @@
+# ============================================================
+#  Laravel / PHP deployment workflow
+#  Place this file at: .github/workflows/deploy.yml
+# ============================================================
+
+name: Deploy Laravel App
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy Laravel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: Tecbeckp/ssh-deploy@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          server-dir: /var/www/html/my-laravel-app/
+          exclude: |
+            **/.git*
+            **/node_modules/**
+            **/vendor/**
+            **/.env
+            **/storage/logs/**
+            **/storage/framework/cache/**
+            **/storage/framework/sessions/**
+            **/storage/framework/views/**
+          commands: |
+            composer install --no-dev --optimize-autoloader
+            php artisan migrate --force
+            php artisan config:cache
+            php artisan route:cache
+            php artisan view:cache
+            php artisan queue:restart
+            sudo systemctl reload php8.3-fpm

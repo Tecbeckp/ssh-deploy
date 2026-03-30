@@ -1,0 +1,47 @@
+{
+  "name": "@tecbeckp/ssh-deploy",
+  "version": "1.0.0",
+  "description": "Deploy files to a server via SSH/SFTP. Smart sync — only uploads changed files. Supports post-deploy commands, exclude patterns, dry-run mode, and incremental deployments.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "ncc build src/main.ts --source-map --license licenses.txt",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write src/**/*.ts",
+    "type-check": "tsc --noEmit"
+  },
+  "keywords": [
+    "github-action",
+    "ssh",
+    "sftp",
+    "deploy",
+    "sync",
+    "upload",
+    "rsync",
+    "incremental",
+    "deployment"
+  ],
+  "author": "Tecbeckp",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tecbeckp/ssh-deploy"
+  },
+  "bugs": {
+    "url": "https://github.com/Tecbeckp/ssh-deploy/issues"
+  },
+  "private": true,
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "ssh2": "^1.16.0",
+    "glob": "^11.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ssh2": "^1.15.4",
+    "@vercel/ncc": "^0.38.3",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,89 @@
+name: "SSH Deploy"
+description: "Deploy files to a server via SSH/SFTP. Smart sync — only uploads changed files. Supports post-deploy commands, exclude patterns, dry-run mode, and incremental deployments."
+author: "Tecbeckp"
+
+branding:
+  icon: "upload-cloud"
+  color: "blue"
+
+inputs:
+  host:
+    description: "SSH server hostname or IP address"
+    required: true
+  port:
+    description: "SSH port"
+    required: false
+    default: "22"
+  username:
+    description: "SSH username"
+    required: true
+  private-key:
+    description: "SSH private key (full content, not path). Use GitHub Secrets!"
+    required: true
+  passphrase:
+    description: "Passphrase for the SSH private key (if encrypted)"
+    required: false
+    default: ""
+  local-dir:
+    description: "Local folder to deploy. Must end with trailing slash."
+    required: false
+    default: "./"
+  server-dir:
+    description: "Remote folder to deploy to. Must end with trailing slash."
+    required: false
+    default: "./"
+  state-name:
+    description: "Name of the sync state file stored on the server to track deployments."
+    required: false
+    default: ".ssh-deploy-sync-state.json"
+  dry-run:
+    description: "Preview changes without actually deploying (true/false)"
+    required: false
+    default: "false"
+  dangerous-clean-slate:
+    description: "Delete ALL existing files on the server before deploying (true/false)"
+    required: false
+    default: "false"
+  exclude:
+    description: "Glob patterns to exclude from deployment (one per line, or comma-separated). .git and node_modules are always excluded."
+    required: false
+    default: |
+      **/.git*
+      **/.git*/**
+      **/node_modules/**
+  log-level:
+    description: "Logging verbosity: minimal, standard, or verbose"
+    required: false
+    default: "standard"
+  timeout:
+    description: "Connection/operation timeout in milliseconds"
+    required: false
+    default: "30000"
+  commands:
+    description: "Commands to run on the server after deployment (one per line). Lines starting with # are ignored."
+    required: false
+    default: ""
+  commands-working-dir:
+    description: "Working directory for post-deploy commands. Defaults to server-dir."
+    required: false
+    default: ""
+
+outputs:
+  files-uploaded:
+    description: "Number of new files uploaded"
+  files-replaced:
+    description: "Number of modified files replaced"
+  files-deleted:
+    description: "Number of deleted files removed from server"
+  files-unchanged:
+    description: "Number of unchanged files"
+  bytes-transferred:
+    description: "Total bytes transferred"
+  duration-ms:
+    description: "Total deployment duration in milliseconds"
+  total-changes:
+    description: "Total number of files changed (uploaded + replaced + deleted)"
+
+runs:
+  using: "node20"
+  main: "dist/index.js"

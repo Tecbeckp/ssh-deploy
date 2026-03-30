@@ -1,0 +1,77 @@
+# ============================================================
+#  Advanced deployment workflow with build step & commands
+#  Place this file at: .github/workflows/deploy.yml
+# ============================================================
+
+name: Build & Deploy via SSH
+
+on:
+  push:
+    branches:
+      - main
+      - production
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Build step (React / Next.js / Vue / etc.) ──
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # ── Deploy the build output ──
+      - name: Deploy to server
+        uses: Tecbeckp/ssh-deploy@v1
+        id: deploy
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USERNAME }}
+          private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          local-dir: build/
+          server-dir: /var/www/html/my-app/
+          dry-run: false
+          log-level: verbose
+          exclude: |
+            **/.git*
+            **/node_modules/**
+            **/*.map
+            **/*.test.js
+          commands: |
+            # Restart the application
+            pm2 restart my-app || true
+            # Clear cache
+            redis-cli FLUSHALL || true
+            # Verify the app is running
+            curl -sf http://localhost:3000/health || echo "Health check failed"
+
+      # ── Use outputs ──
+      - name: Deployment summary
+        run: |
+          echo "Files uploaded: ${{ steps.deploy.outputs.files-uploaded }}"
+          echo "Files replaced: ${{ steps.deploy.outputs.files-replaced }}"
+          echo "Files deleted: ${{ steps.deploy.outputs.files-deleted }}"
+          echo "Total changes: ${{ steps.deploy.outputs.total-changes }}"
+          echo "Duration: ${{ steps.deploy.outputs.duration-ms }}ms"
+
+# ============================================================
+#  REQUIRED SECRETS:
+#    SSH_HOST, SSH_PORT, SSH_USERNAME, SSH_PRIVATE_KEY
+#
+#  OPTIONAL: Use environments for staging vs production:
+#    GitHub repo -> Settings -> Environments
+# ============================================================

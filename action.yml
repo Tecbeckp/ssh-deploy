@@ -1,5 +1,5 @@
-name: "SSH Deploy"
-description: "Deploy files to a server via SSH/SFTP. Smart sync — only uploads changed files. Supports post-deploy commands, exclude patterns, dry-run mode, and incremental deployments."
+name: "Unique SSH Deployer"
+description: "Fast SSH/SFTP file deployment with smart sync for changed files and post-deploy support."
 author: "Tecbeckp"
 
 branding:

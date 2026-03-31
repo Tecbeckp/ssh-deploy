@@ -49231,8 +49231,11 @@ exports.deploy = deploy;
 const path = __importStar(__nccwpck_require__(6928));
 const ssh_client_1 = __nccwpck_require__(1729);
 const hash_1 = __nccwpck_require__(6495);
+const health_check_1 = __nccwpck_require__(3176);
+const notify_1 = __nccwpck_require__(1622);
 const logger_1 = __nccwpck_require__(6999);
-const SYNC_STATE_VERSION = 1;
+const SYNC_STATE_VERSION = 2;
+const TOTAL_STAGES = 11;
 /** Apply defaults to partial arguments */
 function applyDefaults(args) {
     return {
@@ -49249,29 +49252,151 @@ function applyDefaults(args) {
         exclude: args.exclude ?? [],
         logLevel: args.logLevel ?? "standard",
         timeout: args.timeout ?? 30000,
+        preCommands: args.preCommands ?? [],
         commands: args.commands ?? [],
         commandsWorkingDir: args.commandsWorkingDir ?? args.serverDir ?? "./",
+        rollbackOnFailure: args.rollbackOnFailure ?? false,
+        rollbackLimit: args.rollbackLimit ?? 3,
+        healthCheckUrl: args.healthCheckUrl ?? "",
+        healthCheckExpectedStatus: args.healthCheckExpectedStatus ?? 200,
+        healthCheckRetries: args.healthCheckRetries ?? 3,
+        healthCheckRetryDelay: args.healthCheckRetryDelay ?? 5000,
+        healthCheckFailDeploy: args.healthCheckFailDeploy ?? false,
+        webhookUrl: args.webhookUrl ?? "",
+        webhookType: args.webhookType ?? "slack",
+        environment: args.environment ?? "production",
     };
+}
+/** Run a list of commands via SSH, returning results */
+async function runCommands(ssh, commands, cwd, dryRun, logger) {
+    const results = [];
+    if (commands.length === 0)
+        return results;
+    for (let i = 0; i < commands.length; i++) {
+        const cmd = commands[i].trim();
+        if (!cmd || cmd.startsWith("#"))
+            continue;
+        logger.cmdRun(i + 1, commands.length, cmd);
+        if (!dryRun) {
+            const result = await ssh.exec(cmd, cwd);
+            results.push(result);
+            logger.cmdOutput("stdout", result.stdout);
+            logger.cmdOutput("stderr", result.stderr);
+            if (result.exitCode !== 0) {
+                logger.cmdFail(result.exitCode);
+            }
+            else {
+                logger.cmdSuccess(result.durationMs);
+            }
+        }
+        else {
+            logger.info("[DRY RUN] Skipped");
+            results.push({
+                command: cmd,
+                stdout: "",
+                stderr: "",
+                exitCode: 0,
+                durationMs: 0,
+            });
+        }
+    }
+    const passed = results.filter((r) => r.exitCode === 0).length;
+    const failed = results.filter((r) => r.exitCode !== 0).length;
+    logger.cmdSummary(results.length, passed, failed);
+    return results;
+}
+/** Perform rollback by restoring previous sync state */
+async function performRollback(ssh, serverDir, rollbackStatePath, currentLocalFiles, logger) {
+    logger.rollbackBanner();
+    const rollbackContent = await ssh.readFile(rollbackStatePath);
+    if (!rollbackContent) {
+        logger.warn("No rollback state found. Cannot rollback.");
+        return false;
+    }
+    let rollbackState;
+    try {
+        rollbackState = JSON.parse(rollbackContent);
+    }
+    catch {
+        logger.warn("Corrupt rollback state. Cannot rollback.");
+        return false;
+    }
+    logger.info(`Restoring to state from: ${rollbackState.timestamp}`);
+    logger.info(`Rollback state has ${Object.keys(rollbackState.files).length} files`);
+    let removedCount = 0;
+    for (const filePath of Object.keys(currentLocalFiles)) {
+        if (!rollbackState.files[filePath]) {
+            const remotePath = `${serverDir}${filePath}`;
+            try {
+                await ssh.deleteFile(remotePath);
+                await ssh.removeEmptyDirs(remotePath, serverDir);
+                logger.fileDelete(filePath);
+                removedCount++;
+            }
+            catch {
+                // File might not have been uploaded yet
+            }
+        }
+    }
+    logger.success(`Rollback completed. Removed ${removedCount} new file(s).`);
+    return true;
 }
 async function deploy(args) {
     const config = applyDefaults(args);
     const logger = new logger_1.Logger(config.logLevel);
     const startTime = Date.now();
+    const preCommandResults = [];
     const commandResults = [];
-    // Normalize server dir to always end with /
+    let rolledBack = false;
+    let healthCheckResult;
+    let notificationSent = false;
+    // Normalize server dir
     const serverDir = config.serverDir.endsWith("/")
         ? config.serverDir
         : config.serverDir + "/";
     const stateFilePath = `${serverDir}${config.stateName}`;
-    logger.banner("SSH Deploy - Smart Sync");
-    logger.minimal(`  Host:      ${config.host}:${config.port}`);
-    logger.minimal(`  User:      ${config.username}`);
-    logger.minimal(`  Local:     ${path.resolve(config.localDir)}`);
-    logger.minimal(`  Remote:    ${serverDir}`);
-    logger.minimal(`  Dry Run:   ${config.dryRun}`);
-    logger.minimal("");
-    // ── Stage 1: Connect ──
-    logger.banner("Stage 1: Connecting to server");
+    const rollbackStatePath = `${serverDir}.ssh-deploy-rollback-state.json`;
+    const cwd = config.commandsWorkingDir || serverDir;
+    // ── Hero Banner ──
+    logger.heroBanner();
+    // ── Configuration Block ──
+    const configRows = [
+        ["\uD83C\uDF10 Host", `${config.host}:${config.port}`],
+        ["\uD83D\uDC64 User", config.username],
+        ["\uD83D\uDCC2 Local", path.resolve(config.localDir)],
+        ["\uD83D\uDCE1 Remote", serverDir],
+        ["\uD83C\uDFAF Environment", config.environment],
+    ];
+    if (config.dryRun)
+        configRows.push(["\uD83E\uDDEA Dry Run", "ENABLED"]);
+    if (config.rollbackOnFailure)
+        configRows.push(["\u23EA Rollback", "enabled"]);
+    if (config.healthCheckUrl)
+        configRows.push(["\uD83E\uDE7A Health Check", config.healthCheckUrl]);
+    if (config.webhookUrl)
+        configRows.push(["\uD83D\uDD14 Webhook", config.webhookType]);
+    logger.configBlock(configRows);
+    // Helper to build partial result for notifications on early failure
+    const buildResult = (overrides) => ({
+        filesUploaded: 0,
+        filesReplaced: 0,
+        filesDeleted: 0,
+        filesUnchanged: 0,
+        bytesTransferred: 0,
+        durationMs: Date.now() - startTime,
+        preCommandResults,
+        commandResults,
+        diff: { upload: [], replace: [], delete: [], same: [], uploadSize: 0, replaceSize: 0, deleteSize: 0 },
+        rolledBack,
+        healthCheck: healthCheckResult,
+        notificationSent,
+        environment: config.environment,
+        ...overrides,
+    });
+    // ══════════════════════════════════════════════════════════
+    //  STAGE 1: Connect
+    // ══════════════════════════════════════════════════════════
+    logger.stageBanner(1, TOTAL_STAGES, "\uD83D\uDD17", "Connecting to Server");
     const ssh = new ssh_client_1.SSHClient({
         host: config.host,
         port: config.port,
@@ -49282,192 +49407,330 @@ async function deploy(args) {
     }, logger);
     try {
         await ssh.connect();
+        logger.success(`SSH connection established to ${config.host}:${config.port}`);
         await ssh.initSftp();
+        logger.success("SFTP subsystem initialized");
     }
     catch (err) {
+        logger.error(`Connection failed: ${err.message}`);
+        const result = buildResult();
+        if (config.webhookUrl) {
+            notificationSent = await (0, notify_1.sendNotification)(config.webhookUrl, config.webhookType, result, "failure", logger);
+        }
         throw new Error(`Connection failed: ${err.message}`);
     }
     try {
-        // ── Stage 2: Ensure remote directory exists ──
-        logger.banner("Stage 2: Preparing remote directory");
+        // ══════════════════════════════════════════════════════════
+        //  STAGE 2: Prepare Remote Directory
+        // ══════════════════════════════════════════════════════════
+        logger.stageBanner(2, TOTAL_STAGES, "\uD83D\uDCC1", "Preparing Remote Directory");
         await ssh.mkdirRecursive(serverDir);
-        logger.standard(`  Remote directory ready: ${serverDir}`);
-        // ── Stage 3: Read remote sync state ──
-        logger.banner("Stage 3: Reading remote state");
+        logger.success(`Remote directory ready: ${serverDir}`);
+        // ══════════════════════════════════════════════════════════
+        //  STAGE 3: Pre-Deploy Commands
+        // ══════════════════════════════════════════════════════════
+        if (config.preCommands.length > 0) {
+            logger.stageBanner(3, TOTAL_STAGES, "\u2699\uFE0F", "Running Pre-Deploy Commands");
+            const preResults = await runCommands(ssh, config.preCommands, cwd, config.dryRun, logger);
+            preCommandResults.push(...preResults);
+        }
+        else {
+            logger.stageBanner(3, TOTAL_STAGES, "\u2699\uFE0F", "Pre-Deploy Commands");
+            logger.info("No pre-deploy commands configured. Skipping.");
+        }
+        // ══════════════════════════════════════════════════════════
+        //  STAGE 4: Read Remote State
+        // ══════════════════════════════════════════════════════════
+        logger.stageBanner(4, TOTAL_STAGES, "\uD83D\uDCE5", "Reading Remote State");
         let remoteState = null;
         if (config.dangerousCleanSlate) {
-            logger.warn("  dangerous-clean-slate is enabled! Deleting all remote content.");
+            logger.warn("\u26A0\uFE0F  DANGEROUS CLEAN SLATE is enabled!");
+            logger.warn("Deleting ALL remote content before deploying...");
             if (!config.dryRun) {
                 const remoteFiles = await ssh.listFilesRecursive(serverDir);
                 for (const file of remoteFiles) {
                     await ssh.deleteFile(`${serverDir}${file}`);
-                    logger.verbose(`    Deleted: ${file}`);
+                    logger.verbose(`    \uD83D\uDDD1\uFE0F  Deleted: ${file}`);
                 }
+                logger.success(`Cleared ${remoteFiles.length} files from server`);
             }
-            logger.standard("  Remote directory cleared.");
+            else {
+                logger.info("[DRY RUN] Would delete all remote files");
+            }
         }
         else {
             const stateContent = await ssh.readFile(stateFilePath);
             if (stateContent) {
                 try {
                     remoteState = JSON.parse(stateContent);
-                    logger.standard(`  Found existing sync state (${Object.keys(remoteState.files).length} files tracked)`);
+                    const fileCount = Object.keys(remoteState.files).length;
+                    logger.success(`Found sync state: ${fileCount} files tracked`);
                     logger.verbose(`  Last deployed: ${remoteState.timestamp}`);
+                    if (remoteState.environment) {
+                        logger.verbose(`  Environment: ${remoteState.environment}`);
+                    }
                 }
                 catch {
-                    logger.warn("  Corrupt sync state file found, treating as first deploy");
+                    logger.warn("Corrupt sync state file found, treating as first deploy");
                     remoteState = null;
                 }
             }
             else {
-                logger.standard("  No sync state found - first deployment");
+                logger.info("\uD83C\uDD95 No sync state found \u2014 this is the first deployment!");
             }
         }
-        // ── Stage 4: Scan local files & compute diff ──
-        logger.banner("Stage 4: Scanning local files");
+        // ══════════════════════════════════════════════════════════
+        //  STAGE 5: Scan & Compute Diff
+        // ══════════════════════════════════════════════════════════
+        logger.stageBanner(5, TOTAL_STAGES, "\uD83D\uDD0D", "Scanning & Computing Diff");
         const localFiles = await (0, hash_1.getLocalFiles)(config.localDir, config.exclude, logger);
+        logger.success(`Scanned ${Object.keys(localFiles).length} local files`);
         const diff = (0, hash_1.computeDiff)(localFiles, remoteState, logger);
         const totalChanges = diff.upload.length + diff.replace.length + diff.delete.length;
+        logger.diffSummary(diff.upload.length, diff.replace.length, diff.delete.length, diff.same.length, (0, hash_1.formatBytes)(diff.uploadSize), (0, hash_1.formatBytes)(diff.replaceSize), (0, hash_1.formatBytes)(diff.deleteSize));
         if (totalChanges === 0) {
-            logger.minimal("");
-            logger.minimal("  No changes detected. Server is up to date.");
+            logger.noChangesBanner();
+            if (config.healthCheckUrl) {
+                logger.stageBanner(9, TOTAL_STAGES, "\uD83E\uDE7A", "Health Check");
+                healthCheckResult = await (0, health_check_1.runHealthCheck)(config.healthCheckUrl, config.healthCheckExpectedStatus, config.healthCheckRetries, config.healthCheckRetryDelay, config.timeout, logger);
+                if (healthCheckResult.passed) {
+                    logger.success(`Health check passed (${healthCheckResult.responseTimeMs}ms)`);
+                }
+                else {
+                    logger.warn(`Health check failed: ${healthCheckResult.error}`);
+                }
+            }
             ssh.disconnect();
-            return {
-                filesUploaded: 0,
-                filesReplaced: 0,
-                filesDeleted: 0,
-                filesUnchanged: diff.same.length,
-                bytesTransferred: 0,
-                durationMs: Date.now() - startTime,
-                commandResults: [],
-                diff,
-            };
+            const result = buildResult({ filesUnchanged: diff.same.length, diff });
+            if (config.webhookUrl) {
+                notificationSent = await (0, notify_1.sendNotification)(config.webhookUrl, config.webhookType, result, "success", logger);
+            }
+            logger.finalSummary([
+                ["Environment:", config.environment],
+                ["Status:", "\u2705 No changes needed"],
+                ["Tracked files:", String(diff.same.length)],
+            ], "success");
+            return { ...result, notificationSent };
         }
-        // ── Stage 5: Sync files ──
-        logger.banner("Stage 5: Syncing files");
-        logger.minimal(`  Uploading ${diff.upload.length} new file(s) (${(0, hash_1.formatBytes)(diff.uploadSize)})`);
-        logger.minimal(`  Replacing ${diff.replace.length} modified file(s) (${(0, hash_1.formatBytes)(diff.replaceSize)})`);
-        logger.minimal(`  Deleting ${diff.delete.length} removed file(s) (${(0, hash_1.formatBytes)(diff.deleteSize)})`);
-        logger.minimal("");
+        // ══════════════════════════════════════════════════════════
+        //  STAGE 6: Save Rollback Point
+        // ══════════════════════════════════════════════════════════
+        logger.stageBanner(6, TOTAL_STAGES, "\uD83D\uDCBE", "Saving Rollback Point");
+        if (config.rollbackOnFailure && !config.dryRun) {
+            if (remoteState) {
+                await ssh.writeFile(rollbackStatePath, JSON.stringify(remoteState, null, 2));
+                logger.success(`Rollback point saved (${Object.keys(remoteState.files).length} files)`);
+            }
+            else {
+                logger.info("First deployment \u2014 no rollback point needed");
+            }
+        }
+        else if (config.rollbackOnFailure && config.dryRun) {
+            logger.info("[DRY RUN] Would save rollback point");
+        }
+        else {
+            logger.info("Rollback not enabled. Skipping.");
+        }
+        // ══════════════════════════════════════════════════════════
+        //  STAGE 7: Sync Files
+        // ══════════════════════════════════════════════════════════
+        logger.stageBanner(7, TOTAL_STAGES, "\uD83D\uDCE4", "Syncing Files to Server");
         let bytesTransferred = 0;
         if (!config.dryRun) {
             // Upload new files
-            for (const file of diff.upload) {
-                const localPath = path.join(path.resolve(config.localDir), file.path);
-                const remotePath = `${serverDir}${file.path}`;
-                const remoteDir = path.posix.dirname(remotePath);
-                await ssh.mkdirRecursive(remoteDir);
-                await ssh.uploadFile(localPath, remotePath);
-                bytesTransferred += file.size;
-                logger.standard(`    + ${file.path} (${(0, hash_1.formatBytes)(file.size)})`);
+            if (diff.upload.length > 0) {
+                logger.minimal(`  \u2795 Uploading ${diff.upload.length} new file(s)...`);
+                for (const file of diff.upload) {
+                    const localPath = path.join(path.resolve(config.localDir), file.path);
+                    const remotePath = `${serverDir}${file.path}`;
+                    const remoteDir = path.posix.dirname(remotePath);
+                    await ssh.mkdirRecursive(remoteDir);
+                    await ssh.uploadFile(localPath, remotePath);
+                    bytesTransferred += file.size;
+                    logger.fileAdd(file.path, (0, hash_1.formatBytes)(file.size));
+                }
             }
             // Replace modified files
-            for (const file of diff.replace) {
-                const localPath = path.join(path.resolve(config.localDir), file.path);
-                const remotePath = `${serverDir}${file.path}`;
-                await ssh.uploadFile(localPath, remotePath);
-                bytesTransferred += file.size;
-                logger.standard(`    ~ ${file.path} (${(0, hash_1.formatBytes)(file.size)})`);
+            if (diff.replace.length > 0) {
+                logger.minimal(`  \u270F\uFE0F  Replacing ${diff.replace.length} modified file(s)...`);
+                for (const file of diff.replace) {
+                    const localPath = path.join(path.resolve(config.localDir), file.path);
+                    const remotePath = `${serverDir}${file.path}`;
+                    await ssh.uploadFile(localPath, remotePath);
+                    bytesTransferred += file.size;
+                    logger.fileModify(file.path, (0, hash_1.formatBytes)(file.size));
+                }
             }
             // Delete removed files
-            for (const file of diff.delete) {
-                const remotePath = `${serverDir}${file.path}`;
-                await ssh.deleteFile(remotePath);
-                await ssh.removeEmptyDirs(remotePath, serverDir);
-                logger.standard(`    - ${file.path}`);
+            if (diff.delete.length > 0) {
+                logger.minimal(`  \uD83D\uDDD1\uFE0F  Deleting ${diff.delete.length} removed file(s)...`);
+                for (const file of diff.delete) {
+                    const remotePath = `${serverDir}${file.path}`;
+                    await ssh.deleteFile(remotePath);
+                    await ssh.removeEmptyDirs(remotePath, serverDir);
+                    logger.fileDelete(file.path);
+                }
             }
+            logger.minimal("");
+            logger.success(`Sync complete! Transferred ${(0, hash_1.formatBytes)(bytesTransferred)}`);
         }
         else {
-            logger.minimal("  [DRY RUN] No files were changed on the server");
+            logger.minimal("  \uD83E\uDDEA [DRY RUN] No files were changed on the server");
+            logger.minimal("");
             for (const file of diff.upload) {
-                logger.standard(`    + ${file.path} (${(0, hash_1.formatBytes)(file.size)})`);
+                logger.fileAdd(file.path, (0, hash_1.formatBytes)(file.size));
             }
             for (const file of diff.replace) {
-                logger.standard(`    ~ ${file.path} (${(0, hash_1.formatBytes)(file.size)})`);
+                logger.fileModify(file.path, (0, hash_1.formatBytes)(file.size));
             }
             for (const file of diff.delete) {
-                logger.standard(`    - ${file.path}`);
+                logger.fileDelete(file.path);
             }
         }
-        // ── Stage 6: Run post-deploy commands ──
+        // ══════════════════════════════════════════════════════════
+        //  STAGE 8: Post-Deploy Commands
+        // ══════════════════════════════════════════════════════════
         if (config.commands.length > 0) {
-            logger.banner("Stage 6: Running post-deploy commands");
-            const cwd = config.commandsWorkingDir || serverDir;
-            for (let i = 0; i < config.commands.length; i++) {
-                const cmd = config.commands[i].trim();
-                if (!cmd || cmd.startsWith("#"))
-                    continue;
-                logger.standard(`  [${i + 1}/${config.commands.length}] $ ${cmd}`);
-                if (!config.dryRun) {
-                    const result = await ssh.exec(cmd, cwd);
-                    commandResults.push(result);
-                    if (result.stdout) {
-                        logger.verbose(`    stdout: ${result.stdout}`);
-                    }
-                    if (result.stderr) {
-                        logger.verbose(`    stderr: ${result.stderr}`);
-                    }
-                    if (result.exitCode !== 0) {
-                        logger.warn(`    Command failed with exit code ${result.exitCode}`);
-                    }
-                    else {
-                        logger.standard(`    Done (${result.durationMs}ms)`);
-                    }
-                }
-                else {
-                    logger.standard("    [DRY RUN] Skipped");
-                    commandResults.push({
-                        command: cmd,
-                        stdout: "",
-                        stderr: "",
-                        exitCode: 0,
-                        durationMs: 0,
-                    });
-                }
-            }
-        }
-        // ── Stage 7: Save sync state ──
-        logger.banner("Stage 7: Saving sync state");
-        if (!config.dryRun) {
-            const newState = {
-                version: SYNC_STATE_VERSION,
-                timestamp: new Date().toISOString(),
-                commitHash: process.env.GITHUB_SHA || undefined,
-                files: localFiles,
-            };
-            await ssh.writeFile(stateFilePath, JSON.stringify(newState, null, 2));
-            logger.standard(`  Sync state saved to ${stateFilePath}`);
+            logger.stageBanner(8, TOTAL_STAGES, "\u2699\uFE0F", "Running Post-Deploy Commands");
+            const postResults = await runCommands(ssh, config.commands, cwd, config.dryRun, logger);
+            commandResults.push(...postResults);
         }
         else {
-            logger.standard("  [DRY RUN] Sync state not updated");
+            logger.stageBanner(8, TOTAL_STAGES, "\u2699\uFE0F", "Post-Deploy Commands");
+            logger.info("No post-deploy commands configured. Skipping.");
         }
-        // ── Summary ──
+        // ══════════════════════════════════════════════════════════
+        //  STAGE 9: Health Check
+        // ══════════════════════════════════════════════════════════
+        if (config.healthCheckUrl) {
+            logger.stageBanner(9, TOTAL_STAGES, "\uD83E\uDE7A", "Health Check");
+            logger.info(`URL: ${config.healthCheckUrl}`);
+            logger.info(`Expected status: ${config.healthCheckExpectedStatus}`);
+            logger.info(`Max retries: ${config.healthCheckRetries}`);
+            logger.minimal("");
+            healthCheckResult = await (0, health_check_1.runHealthCheck)(config.healthCheckUrl, config.healthCheckExpectedStatus, config.healthCheckRetries, config.healthCheckRetryDelay, config.timeout, logger);
+            if (healthCheckResult.passed) {
+                logger.success(`Health check PASSED in ${healthCheckResult.attempts} attempt(s) (${healthCheckResult.responseTimeMs}ms)`);
+            }
+            else {
+                logger.error(`Health check FAILED after ${healthCheckResult.attempts} attempt(s): ${healthCheckResult.error}`);
+                // Rollback if configured
+                if (config.rollbackOnFailure && config.healthCheckFailDeploy && !config.dryRun) {
+                    rolledBack = await performRollback(ssh, serverDir, rollbackStatePath, localFiles, logger);
+                    if (rolledBack) {
+                        const oldState = await ssh.readFile(rollbackStatePath);
+                        if (oldState) {
+                            await ssh.writeFile(stateFilePath, oldState);
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            logger.stageBanner(9, TOTAL_STAGES, "\uD83E\uDE7A", "Health Check");
+            logger.info("No health check URL configured. Skipping.");
+        }
+        // ══════════════════════════════════════════════════════════
+        //  STAGE 10: Save Sync State
+        // ══════════════════════════════════════════════════════════
+        logger.stageBanner(10, TOTAL_STAGES, "\uD83D\uDCBE", "Saving Sync State");
+        if (!rolledBack) {
+            if (!config.dryRun) {
+                const newState = {
+                    version: SYNC_STATE_VERSION,
+                    timestamp: new Date().toISOString(),
+                    commitHash: process.env.GITHUB_SHA || undefined,
+                    environment: config.environment,
+                    files: localFiles,
+                };
+                await ssh.writeFile(stateFilePath, JSON.stringify(newState, null, 2));
+                logger.success(`Sync state saved (${Object.keys(localFiles).length} files tracked)`);
+                logger.info(`State file: ${stateFilePath}`);
+            }
+            else {
+                logger.info("[DRY RUN] Sync state not updated");
+            }
+        }
+        else {
+            logger.warn("Sync state restored to previous version (rollback)");
+        }
+        // ══════════════════════════════════════════════════════════
+        //  STAGE 11: Notifications
+        // ══════════════════════════════════════════════════════════
         const durationMs = Date.now() - startTime;
-        logger.banner("Deployment Complete");
-        logger.summary([
-            ["New files:", String(diff.upload.length)],
-            ["Modified files:", String(diff.replace.length)],
-            ["Deleted files:", String(diff.delete.length)],
-            ["Unchanged files:", String(diff.same.length)],
-            ["Bytes transferred:", (0, hash_1.formatBytes)(bytesTransferred)],
-            ["Duration:", `${(durationMs / 1000).toFixed(1)}s`],
-            ["Commands run:", String(commandResults.length)],
-        ]);
-        logger.minimal("");
-        ssh.disconnect();
-        return {
+        const finalResult = {
             filesUploaded: diff.upload.length,
             filesReplaced: diff.replace.length,
             filesDeleted: diff.delete.length,
             filesUnchanged: diff.same.length,
             bytesTransferred,
             durationMs,
+            preCommandResults,
             commandResults,
             diff,
+            rolledBack,
+            healthCheck: healthCheckResult,
+            notificationSent: false,
+            environment: config.environment,
         };
+        if (config.webhookUrl) {
+            logger.stageBanner(11, TOTAL_STAGES, "\uD83D\uDD14", "Sending Notification");
+            const status = rolledBack ? "rolled_back" : "success";
+            notificationSent = await (0, notify_1.sendNotification)(config.webhookUrl, config.webhookType, finalResult, status, logger);
+            finalResult.notificationSent = notificationSent;
+            if (notificationSent) {
+                logger.success(`${config.webhookType} notification sent successfully`);
+            }
+            else {
+                logger.warn("Failed to send notification");
+            }
+        }
+        else {
+            logger.stageBanner(11, TOTAL_STAGES, "\uD83D\uDD14", "Notifications");
+            logger.info("No webhook configured. Skipping.");
+        }
+        ssh.disconnect();
+        // ══════════════════════════════════════════════════════════
+        //  FINAL SUMMARY
+        // ══════════════════════════════════════════════════════════
+        const commitHash = process.env.GITHUB_SHA?.substring(0, 8) || "local";
+        const summaryStatus = rolledBack ? "rolled_back" : "success";
+        logger.finalSummary([
+            ["\uD83C\uDFAF Environment:", config.environment],
+            ["\uD83D\uDD17 Server:", `${config.host}:${config.port}`],
+            ["\uD83D\uDCE1 Remote Path:", serverDir],
+            ["\uD83D\uDD16 Commit:", commitHash],
+            ["", ""],
+            ["\u2795 New files:", String(diff.upload.length)],
+            ["\u270F\uFE0F  Modified:", String(diff.replace.length)],
+            ["\uD83D\uDDD1\uFE0F  Deleted:", String(diff.delete.length)],
+            ["\u2796 Unchanged:", String(diff.same.length)],
+            ["\uD83D\uDCE6 Transferred:", (0, hash_1.formatBytes)(bytesTransferred)],
+            ["", ""],
+            ["\u23F1\uFE0F  Duration:", `${(durationMs / 1000).toFixed(1)}s`],
+            ["\u2699\uFE0F  Pre-commands:", `${preCommandResults.length} run`],
+            ["\u2699\uFE0F  Post-commands:", `${commandResults.length} run`],
+            ["\uD83E\uDE7A Health check:", healthCheckResult ? (healthCheckResult.passed ? "\u2705 PASSED" : "\u274C FAILED") : "N/A"],
+            ["\u23EA Rolled back:", rolledBack ? "\u26A0\uFE0F  YES" : "No"],
+            ["\uD83D\uDD14 Notified:", notificationSent ? "\u2705 Sent" : "N/A"],
+        ], summaryStatus);
+        // If health check failed and should fail the deploy
+        if (healthCheckResult && !healthCheckResult.passed && config.healthCheckFailDeploy) {
+            throw new Error(`Health check failed: ${healthCheckResult.error}`);
+        }
+        return finalResult;
     }
     catch (err) {
+        // Send failure notification
+        if (config.webhookUrl) {
+            const failResult = buildResult();
+            await (0, notify_1.sendNotification)(config.webhookUrl, config.webhookType, failResult, "failure", logger);
+        }
         ssh.disconnect();
+        logger.finalSummary([
+            ["\uD83C\uDFAF Environment:", config.environment],
+            ["\uD83D\uDCA5 Error:", err.message],
+        ], "failure");
         throw err;
     }
 }
@@ -49606,6 +49869,117 @@ function formatBytes(bytes) {
 
 /***/ }),
 
+/***/ 3176:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.runHealthCheck = runHealthCheck;
+const https = __importStar(__nccwpck_require__(5692));
+const http = __importStar(__nccwpck_require__(8611));
+/** Perform a single HTTP(S) GET request and return status code */
+function httpGet(url, timeout) {
+    const startTime = Date.now();
+    const client = url.startsWith("https") ? https : http;
+    return new Promise((resolve, reject) => {
+        const req = client.get(url, { timeout }, (res) => {
+            res.resume();
+            resolve({
+                statusCode: res.statusCode ?? 0,
+                responseTimeMs: Date.now() - startTime,
+            });
+        });
+        req.on("error", (err) => {
+            reject(err);
+        });
+        req.on("timeout", () => {
+            req.destroy();
+            reject(new Error(`Health check timed out after ${timeout}ms`));
+        });
+    });
+}
+/** Sleep for a given number of milliseconds */
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+/** Run health check with retries */
+async function runHealthCheck(url, expectedStatus, retries, retryDelay, timeout, logger) {
+    let lastError;
+    let lastStatusCode = 0;
+    let lastResponseTime = 0;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        logger.minimal(`  \uD83D\uDC93 Attempt ${attempt}/${retries}...`);
+        try {
+            const result = await httpGet(url, timeout);
+            lastStatusCode = result.statusCode;
+            lastResponseTime = result.responseTimeMs;
+            if (result.statusCode === expectedStatus) {
+                logger.success(`Status: ${result.statusCode} \u2014 Response time: ${result.responseTimeMs}ms`);
+                return {
+                    passed: true,
+                    statusCode: result.statusCode,
+                    responseTimeMs: result.responseTimeMs,
+                    attempts: attempt,
+                };
+            }
+            lastError = `Expected status ${expectedStatus}, got ${result.statusCode}`;
+            logger.warn(`${lastError} (${result.responseTimeMs}ms)`);
+        }
+        catch (err) {
+            lastError = err.message;
+            logger.warn(`Request failed: ${lastError}`);
+        }
+        if (attempt < retries) {
+            logger.info(`Retrying in ${retryDelay / 1000}s...`);
+            await sleep(retryDelay);
+        }
+    }
+    return {
+        passed: false,
+        statusCode: lastStatusCode,
+        responseTimeMs: lastResponseTime,
+        attempts: retries,
+        error: lastError,
+    };
+}
+
+
+/***/ }),
+
 /***/ 6999:
 /***/ ((__unused_webpack_module, exports) => {
 
@@ -49640,25 +50014,191 @@ class Logger {
             console.log(message);
         }
     }
-    /** Banner-style output for stage headers */
+    /** Error output - always shown */
+    error(message) {
+        console.error(`  \u274C ${message}`);
+    }
+    /** Warning output - always shown */
+    warn(message) {
+        console.warn(`  \u26A0\uFE0F  ${message}`);
+    }
+    /** Success line */
+    success(message) {
+        if (this.shouldLog("minimal")) {
+            console.log(`  \u2705 ${message}`);
+        }
+    }
+    /** Info line */
+    info(message) {
+        if (this.shouldLog("standard")) {
+            console.log(`  \u2139\uFE0F  ${message}`);
+        }
+    }
+    /** Main hero banner - shown once at the very start */
+    heroBanner() {
+        if (!this.shouldLog("minimal"))
+            return;
+        console.log("");
+        console.log("\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557");
+        console.log("\u2551                                                            \u2551");
+        console.log("\u2551        \uD83D\uDE80 SSH DEPLOY - SMART SYNC                        \u2551");
+        console.log("\u2551        Secure \u2022 Incremental \u2022 Intelligent                  \u2551");
+        console.log("\u2551                                                            \u2551");
+        console.log("\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D");
+        console.log("");
+    }
+    /** Stage banner with icon and step count */
+    stageBanner(stageNum, totalStages, icon, title) {
+        if (!this.shouldLog("minimal"))
+            return;
+        console.log("");
+        console.log("\u2552\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2555");
+        console.log(`\u2502  ${icon}  Stage ${stageNum}/${totalStages}: ${title.padEnd(43)}\u2502`);
+        console.log("\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518");
+        console.log("");
+    }
+    /** Special banner for rollback */
+    rollbackBanner() {
+        if (!this.shouldLog("minimal"))
+            return;
+        console.log("");
+        console.log("\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557");
+        console.log("\u2551        \u23EA ROLLBACK IN PROGRESS                            \u2551");
+        console.log("\u2551        Restoring previous deployment state...            \u2551");
+        console.log("\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D");
+        console.log("");
+    }
+    /** Config info block */
+    configBlock(rows) {
+        if (!this.shouldLog("minimal"))
+            return;
+        console.log("  \u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510");
+        console.log("  \u2502           \uD83D\uDCCB Deployment Configuration                \u2502");
+        console.log("  \u251C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524");
+        const maxKey = Math.max(...rows.map(([k]) => k.length));
+        for (const [key, value] of rows) {
+            const line = `  \u2502  ${key.padEnd(maxKey + 2)} ${value}`;
+            console.log(line.padEnd(59) + "\u2502");
+        }
+        console.log("  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518");
+        console.log("");
+    }
+    /** Changes summary box */
+    diffSummary(added, modified, deleted, unchanged, addedSize, modifiedSize, deletedSize) {
+        if (!this.shouldLog("minimal"))
+            return;
+        console.log("  \u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510");
+        console.log("  \u2502          \uD83D\uDCCA  Changes Summary            \u2502");
+        console.log("  \u251C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524");
+        console.log(`  \u2502  \u2795 New files     : ${String(added).padEnd(5)} (${addedSize})`.padEnd(45) + "\u2502");
+        console.log(`  \u2502  \u270F\uFE0F  Modified     : ${String(modified).padEnd(5)} (${modifiedSize})`.padEnd(45) + "\u2502");
+        console.log(`  \u2502  \uD83D\uDDD1\uFE0F  Deleted      : ${String(deleted).padEnd(5)} (${deletedSize})`.padEnd(45) + "\u2502");
+        console.log(`  \u2502  \u2796 Unchanged    : ${String(unchanged).padEnd(5)}`.padEnd(45) + "\u2502");
+        console.log("  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518");
+        console.log("");
+    }
+    /** File transfer line */
+    fileAdd(filePath, size) {
+        if (this.shouldLog("standard")) {
+            console.log(`     \u2795 ${filePath} (${size})`);
+        }
+    }
+    fileModify(filePath, size) {
+        if (this.shouldLog("standard")) {
+            console.log(`     \u270F\uFE0F  ${filePath} (${size})`);
+        }
+    }
+    fileDelete(filePath) {
+        if (this.shouldLog("standard")) {
+            console.log(`     \uD83D\uDDD1\uFE0F  ${filePath}`);
+        }
+    }
+    /** Command execution line */
+    cmdRun(index, total, cmd) {
+        if (this.shouldLog("standard")) {
+            console.log(`  \u25B6\uFE0F  [${index}/${total}] $ ${cmd}`);
+        }
+    }
+    cmdSuccess(durationMs) {
+        if (this.shouldLog("standard")) {
+            console.log(`     \u2705 Done (${durationMs}ms)`);
+        }
+    }
+    cmdFail(exitCode) {
+        console.log(`     \u274C Failed (exit code: ${exitCode})`);
+    }
+    cmdOutput(label, output) {
+        if (this.shouldLog("verbose") && output) {
+            console.log(`     \uD83D\uDCCB ${label}:`);
+            for (const line of output.split("\n")) {
+                console.log(`        ${line}`);
+            }
+        }
+    }
+    /** Final summary box */
+    finalSummary(rows, status) {
+        if (!this.shouldLog("minimal"))
+            return;
+        const icon = status === "success" ? "\uD83C\uDF89" : status === "rolled_back" ? "\u23EA" : "\uD83D\uDCA5";
+        const title = status === "success"
+            ? "DEPLOYMENT COMPLETED SUCCESSFULLY!"
+            : status === "rolled_back"
+                ? "DEPLOYMENT ROLLED BACK"
+                : "DEPLOYMENT FAILED";
+        console.log("");
+        console.log("\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557");
+        console.log("\u2551                                                            \u2551");
+        const titleLine = `\u2551      ${icon} ${title}`;
+        console.log(titleLine.padEnd(61) + "\u2551");
+        console.log("\u2551                                                            \u2551");
+        console.log("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563");
+        const maxKey = Math.max(...rows.map(([k]) => k.length));
+        for (const [key, value] of rows) {
+            const line = `\u2551  ${key.padEnd(maxKey + 2)} ${value}`;
+            console.log(line.padEnd(61) + "\u2551");
+        }
+        console.log("\u2551                                                            \u2551");
+        console.log("\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D");
+        console.log("");
+    }
+    /** No changes banner */
+    noChangesBanner() {
+        if (!this.shouldLog("minimal"))
+            return;
+        console.log("");
+        console.log("\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557");
+        console.log("\u2551                                                            \u2551");
+        console.log("\u2551        \u2139\uFE0F  NO CHANGES DETECTED                             \u2551");
+        console.log("\u2551        Server is already up to date.                      \u2551");
+        console.log("\u2551                                                            \u2551");
+        console.log("\u255A\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255D");
+        console.log("");
+    }
+    /** Commands summary box */
+    cmdSummary(total, passed, failed) {
+        if (!this.shouldLog("minimal"))
+            return;
+        console.log("");
+        console.log("  \u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510");
+        console.log("  \u2502     \u2699\uFE0F  Commands Summary              \u2502");
+        console.log("  \u251C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524");
+        console.log(`  \u2502  Total     : ${String(total).padEnd(23)}\u2502`);
+        console.log(`  \u2502  \u2705 Passed  : ${String(passed).padEnd(23)}\u2502`);
+        console.log(`  \u2502  \u274C Failed  : ${String(failed).padEnd(23)}\u2502`);
+        console.log("  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518");
+        console.log("");
+    }
+    /** Deprecated - kept for backward compat */
     banner(title) {
         if (this.shouldLog("minimal")) {
-            const line = "-".repeat(60);
+            const line = "\u2500".repeat(60);
             console.log("");
             console.log(line);
             console.log(`  ${title}`);
             console.log(line);
         }
     }
-    /** Error output - always shown */
-    error(message) {
-        console.error(`[ERROR] ${message}`);
-    }
-    /** Warning output - always shown */
-    warn(message) {
-        console.warn(`[WARN] ${message}`);
-    }
-    /** Summary table */
+    /** Deprecated - kept for backward compat */
     summary(rows) {
         if (!this.shouldLog("minimal"))
             return;
@@ -49744,18 +50284,28 @@ function optionalLogLevel(name) {
         return val;
     throw new Error(`Input "${name}" must be "minimal", "standard", or "verbose", got "${val}"`);
 }
+function optionalWebhookType(name) {
+    const val = core.getInput(name).toLowerCase();
+    if (val === "" || val === "slack")
+        return "slack";
+    if (val === "discord" || val === "custom")
+        return val;
+    throw new Error(`Input "${name}" must be "slack", "discord", or "custom", got "${val}"`);
+}
+function parseMultilineInput(name) {
+    return core
+        .getMultilineInput(name)
+        .filter((line) => {
+        const trimmed = line.trim();
+        return trimmed !== "" && !trimmed.startsWith("#");
+    });
+}
 async function run() {
     try {
         const exclude = core
             .getMultilineInput("exclude")
             .flatMap((line) => line.split(",").map((s) => s.trim()))
             .filter(Boolean);
-        const commands = core
-            .getMultilineInput("commands")
-            .filter((line) => {
-            const trimmed = line.trim();
-            return trimmed !== "" && !trimmed.startsWith("#");
-        });
         const args = {
             host: core.getInput("host", { required: true }),
             port: optionalInt("port", 22),
@@ -49770,14 +50320,26 @@ async function run() {
             exclude,
             logLevel: optionalLogLevel("log-level"),
             timeout: optionalInt("timeout", 30000),
-            commands,
+            preCommands: parseMultilineInput("pre-commands"),
+            commands: parseMultilineInput("commands"),
             commandsWorkingDir: optionalString("commands-working-dir"),
+            rollbackOnFailure: optionalBool("rollback-on-failure", false),
+            rollbackLimit: optionalInt("rollback-limit", 3),
+            healthCheckUrl: optionalString("health-check-url"),
+            healthCheckExpectedStatus: optionalInt("health-check-status", 200),
+            healthCheckRetries: optionalInt("health-check-retries", 3),
+            healthCheckRetryDelay: optionalInt("health-check-retry-delay", 5000),
+            healthCheckFailDeploy: optionalBool("health-check-fail-deploy", false),
+            webhookUrl: optionalString("webhook-url"),
+            webhookType: optionalWebhookType("webhook-type"),
+            environment: core.getInput("environment") || "production",
         };
-        // Mask the private key in logs
+        // Mask secrets in logs
         core.setSecret(args.privateKey);
-        if (args.passphrase) {
+        if (args.passphrase)
             core.setSecret(args.passphrase);
-        }
+        if (args.webhookUrl)
+            core.setSecret(args.webhookUrl);
         const result = await (0, deploy_1.deploy)(args);
         // Set outputs
         core.setOutput("files-uploaded", result.filesUploaded);
@@ -49787,10 +50349,21 @@ async function run() {
         core.setOutput("bytes-transferred", result.bytesTransferred);
         core.setOutput("duration-ms", result.durationMs);
         core.setOutput("total-changes", result.filesUploaded + result.filesReplaced + result.filesDeleted);
-        // Check for failed commands
-        const failedCommands = result.commandResults.filter((r) => r.exitCode !== 0);
-        if (failedCommands.length > 0) {
-            core.warning(`${failedCommands.length} post-deploy command(s) failed. Check logs for details.`);
+        core.setOutput("rolled-back", result.rolledBack);
+        core.setOutput("health-check-passed", result.healthCheck?.passed ?? "N/A");
+        core.setOutput("notification-sent", result.notificationSent);
+        core.setOutput("environment", result.environment);
+        // Warnings
+        const failedPreCmds = result.preCommandResults.filter((r) => r.exitCode !== 0);
+        if (failedPreCmds.length > 0) {
+            core.warning(`${failedPreCmds.length} pre-deploy command(s) failed.`);
+        }
+        const failedPostCmds = result.commandResults.filter((r) => r.exitCode !== 0);
+        if (failedPostCmds.length > 0) {
+            core.warning(`${failedPostCmds.length} post-deploy command(s) failed.`);
+        }
+        if (result.rolledBack) {
+            core.warning("Deployment was rolled back due to health check failure.");
         }
     }
     catch (error) {
@@ -49798,6 +50371,226 @@ async function run() {
     }
 }
 run();
+
+
+/***/ }),
+
+/***/ 1622:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.sendNotification = sendNotification;
+const https = __importStar(__nccwpck_require__(5692));
+const http = __importStar(__nccwpck_require__(8611));
+/** Send HTTP POST request with JSON body */
+function httpPost(url, body) {
+    const client = url.startsWith("https") ? https : http;
+    const parsed = new URL(url);
+    return new Promise((resolve, reject) => {
+        const req = client.request({
+            hostname: parsed.hostname,
+            port: parsed.port,
+            path: parsed.pathname + parsed.search,
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(body),
+            },
+            timeout: 10000,
+        }, (res) => {
+            res.resume();
+            resolve(res.statusCode ?? 0);
+        });
+        req.on("error", reject);
+        req.on("timeout", () => {
+            req.destroy();
+            reject(new Error("Notification request timed out"));
+        });
+        req.write(body);
+        req.end();
+    });
+}
+/** Format bytes to human-readable */
+function fmtBytes(bytes) {
+    if (bytes === 0)
+        return "0 B";
+    const sizes = ["B", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${sizes[i]}`;
+}
+/** Build Slack message payload */
+function buildSlackPayload(result, status) {
+    const emoji = status === "success" ? ":white_check_mark:" : status === "rolled_back" ? ":rewind:" : ":x:";
+    const color = status === "success" ? "#36a64f" : status === "rolled_back" ? "#ff9900" : "#dc3545";
+    const title = status === "success"
+        ? "Deployment Successful"
+        : status === "rolled_back"
+            ? "Deployment Rolled Back"
+            : "Deployment Failed";
+    const commitHash = process.env.GITHUB_SHA?.substring(0, 8) || "unknown";
+    const repo = process.env.GITHUB_REPOSITORY || "unknown";
+    const runUrl = process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
+        ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+        : "";
+    return JSON.stringify({
+        attachments: [
+            {
+                color,
+                blocks: [
+                    {
+                        type: "section",
+                        text: {
+                            type: "mrkdwn",
+                            text: `${emoji} *${title}*\n*Env:* \`${result.environment}\` | *Repo:* \`${repo}\` | *Commit:* \`${commitHash}\``,
+                        },
+                    },
+                    {
+                        type: "section",
+                        fields: [
+                            { type: "mrkdwn", text: `*New Files:*\n${result.filesUploaded}` },
+                            { type: "mrkdwn", text: `*Modified:*\n${result.filesReplaced}` },
+                            { type: "mrkdwn", text: `*Deleted:*\n${result.filesDeleted}` },
+                            { type: "mrkdwn", text: `*Transferred:*\n${fmtBytes(result.bytesTransferred)}` },
+                            { type: "mrkdwn", text: `*Duration:*\n${(result.durationMs / 1000).toFixed(1)}s` },
+                            { type: "mrkdwn", text: `*Health Check:*\n${result.healthCheck ? (result.healthCheck.passed ? "Passed" : "Failed") : "N/A"}` },
+                        ],
+                    },
+                    ...(runUrl
+                        ? [
+                            {
+                                type: "actions",
+                                elements: [
+                                    {
+                                        type: "button",
+                                        text: { type: "plain_text", text: "View Run" },
+                                        url: runUrl,
+                                    },
+                                ],
+                            },
+                        ]
+                        : []),
+                ],
+            },
+        ],
+    });
+}
+/** Build Discord message payload */
+function buildDiscordPayload(result, status) {
+    const emoji = status === "success" ? "✅" : status === "rolled_back" ? "⏪" : "❌";
+    const color = status === "success" ? 0x36a64f : status === "rolled_back" ? 0xff9900 : 0xdc3545;
+    const title = status === "success"
+        ? "Deployment Successful"
+        : status === "rolled_back"
+            ? "Deployment Rolled Back"
+            : "Deployment Failed";
+    const commitHash = process.env.GITHUB_SHA?.substring(0, 8) || "unknown";
+    const repo = process.env.GITHUB_REPOSITORY || "unknown";
+    const runUrl = process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
+        ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+        : undefined;
+    return JSON.stringify({
+        embeds: [
+            {
+                title: `${emoji} ${title}`,
+                color,
+                description: `**Env:** \`${result.environment}\` | **Repo:** \`${repo}\` | **Commit:** \`${commitHash}\``,
+                fields: [
+                    { name: "New Files", value: String(result.filesUploaded), inline: true },
+                    { name: "Modified", value: String(result.filesReplaced), inline: true },
+                    { name: "Deleted", value: String(result.filesDeleted), inline: true },
+                    { name: "Transferred", value: fmtBytes(result.bytesTransferred), inline: true },
+                    { name: "Duration", value: `${(result.durationMs / 1000).toFixed(1)}s`, inline: true },
+                    { name: "Health Check", value: result.healthCheck ? (result.healthCheck.passed ? "Passed ✅" : "Failed ❌") : "N/A", inline: true },
+                ],
+                ...(runUrl ? { url: runUrl } : {}),
+                timestamp: new Date().toISOString(),
+            },
+        ],
+    });
+}
+/** Build a simple JSON payload for custom webhooks */
+function buildCustomPayload(result, status) {
+    return JSON.stringify({
+        status,
+        environment: result.environment,
+        repository: process.env.GITHUB_REPOSITORY || "unknown",
+        commit: process.env.GITHUB_SHA || "unknown",
+        ref: process.env.GITHUB_REF || "unknown",
+        filesUploaded: result.filesUploaded,
+        filesReplaced: result.filesReplaced,
+        filesDeleted: result.filesDeleted,
+        filesUnchanged: result.filesUnchanged,
+        bytesTransferred: result.bytesTransferred,
+        durationMs: result.durationMs,
+        rolledBack: result.rolledBack,
+        healthCheck: result.healthCheck ?? null,
+        timestamp: new Date().toISOString(),
+    });
+}
+/** Send deployment notification */
+async function sendNotification(webhookUrl, webhookType, result, status, logger) {
+    logger.standard(`  Sending ${webhookType} notification...`);
+    let payload;
+    switch (webhookType) {
+        case "slack":
+            payload = buildSlackPayload(result, status);
+            break;
+        case "discord":
+            payload = buildDiscordPayload(result, status);
+            break;
+        case "custom":
+            payload = buildCustomPayload(result, status);
+            break;
+    }
+    try {
+        const statusCode = await httpPost(webhookUrl, payload);
+        if (statusCode >= 200 && statusCode < 300) {
+            logger.standard(`  Notification sent successfully (HTTP ${statusCode})`);
+            return true;
+        }
+        logger.warn(`  Notification returned HTTP ${statusCode}`);
+        return false;
+    }
+    catch (err) {
+        logger.warn(`  Failed to send notification: ${err.message}`);
+        return false;
+    }
+}
 
 
 /***/ }),

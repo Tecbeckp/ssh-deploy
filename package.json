@@ -1,6 +1,6 @@
 {
   "name": "@tecbeckp/ssh-deploy",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Deploy files to a server via SSH/SFTP. Smart sync — only uploads changed files. Supports post-deploy commands, exclude patterns, dry-run mode, and incremental deployments.",
   "main": "dist/index.js",
   "scripts": {

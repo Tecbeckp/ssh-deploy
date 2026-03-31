@@ -1,5 +1,5 @@
 # ============================================================
-#  Advanced deployment workflow with build step & commands
+#  Advanced deployment with all features
 #  Place this file at: .github/workflows/deploy.yml
 # ============================================================
 
@@ -9,69 +9,95 @@ on:
   push:
     branches:
       - main
-      - production
+      - staging
 
 jobs:
-  deploy:
-    name: Build & Deploy
+  deploy-staging:
+    name: Deploy to Staging
+    if: github.ref == 'refs/heads/staging'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── Build step (React / Next.js / Vue / etc.) ──
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
+      - run: npm run build
 
-      - name: Build
-        run: npm run build
-
-      # ── Deploy the build output ──
-      - name: Deploy to server
+      - name: Deploy to Staging
         uses: Tecbeckp/ssh-deploy@v1
         id: deploy
         with:
-          host: ${{ secrets.SSH_HOST }}
-          port: ${{ secrets.SSH_PORT }}
-          username: ${{ secrets.SSH_USERNAME }}
-          private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          host: ${{ secrets.STAGING_SSH_HOST }}
+          username: ${{ secrets.STAGING_SSH_USERNAME }}
+          private-key: ${{ secrets.STAGING_SSH_KEY }}
           local-dir: build/
-          server-dir: /var/www/html/my-app/
-          dry-run: false
+          server-dir: /var/www/staging/
+          environment: staging
           log-level: verbose
           exclude: |
             **/.git*
             **/node_modules/**
             **/*.map
-            **/*.test.js
+          pre-commands: |
+            echo "Starting staging deployment..."
           commands: |
-            # Restart the application
-            pm2 restart my-app || true
-            # Clear cache
-            redis-cli FLUSHALL || true
-            # Verify the app is running
-            curl -sf http://localhost:3000/health || echo "Health check failed"
+            pm2 restart staging-app || true
+          health-check-url: https://staging.example.com/health
+          health-check-retries: 3
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: slack
 
-      # ── Use outputs ──
-      - name: Deployment summary
+      - name: Summary
         run: |
-          echo "Files uploaded: ${{ steps.deploy.outputs.files-uploaded }}"
-          echo "Files replaced: ${{ steps.deploy.outputs.files-replaced }}"
-          echo "Files deleted: ${{ steps.deploy.outputs.files-deleted }}"
-          echo "Total changes: ${{ steps.deploy.outputs.total-changes }}"
-          echo "Duration: ${{ steps.deploy.outputs.duration-ms }}ms"
+          echo "Files: ${{ steps.deploy.outputs.total-changes }} changed"
+          echo "Health: ${{ steps.deploy.outputs.health-check-passed }}"
 
-# ============================================================
-#  REQUIRED SECRETS:
-#    SSH_HOST, SSH_PORT, SSH_USERNAME, SSH_PRIVATE_KEY
-#
-#  OPTIONAL: Use environments for staging vs production:
-#    GitHub repo -> Settings -> Environments
-# ============================================================
+  deploy-production:
+    name: Deploy to Production
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production  # Requires manual approval if configured
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Deploy to Production
+        uses: Tecbeckp/ssh-deploy@v1
+        with:
+          host: ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USERNAME }}
+          private-key: ${{ secrets.PROD_SSH_KEY }}
+          local-dir: build/
+          server-dir: /var/www/production/
+          environment: production
+          log-level: standard
+          exclude: |
+            **/.git*
+            **/node_modules/**
+            **/*.map
+            **/*.test.js
+          pre-commands: |
+            # Backup current deployment
+            tar -czf /backups/prod-$(date +%Y%m%d-%H%M%S).tar.gz /var/www/production/ || true
+          commands: |
+            pm2 restart production-app
+          rollback-on-failure: true
+          health-check-url: https://example.com/health
+          health-check-retries: 5
+          health-check-retry-delay: 3000
+          health-check-fail-deploy: true
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: slack

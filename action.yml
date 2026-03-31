@@ -59,14 +59,70 @@ inputs:
     description: "Connection/operation timeout in milliseconds"
     required: false
     default: "30000"
+
+  # ── Pre-Deploy Commands ──
+  pre-commands:
+    description: "Commands to run on server BEFORE file sync (one per line). Use for maintenance mode, backups, etc."
+    required: false
+    default: ""
+
+  # ── Post-Deploy Commands ──
   commands:
-    description: "Commands to run on the server after deployment (one per line). Lines starting with # are ignored."
+    description: "Commands to run on the server AFTER file sync (one per line). Lines starting with # are ignored."
     required: false
     default: ""
   commands-working-dir:
-    description: "Working directory for post-deploy commands. Defaults to server-dir."
+    description: "Working directory for remote commands. Defaults to server-dir."
     required: false
     default: ""
+
+  # ── Rollback ──
+  rollback-on-failure:
+    description: "Rollback deployment if health check fails (true/false). Requires health-check-url and health-check-fail-deploy."
+    required: false
+    default: "false"
+  rollback-limit:
+    description: "Maximum rollback states to keep on server"
+    required: false
+    default: "3"
+
+  # ── Health Check ──
+  health-check-url:
+    description: "URL to check after deployment (e.g., https://example.com/health). Leave empty to skip."
+    required: false
+    default: ""
+  health-check-status:
+    description: "Expected HTTP status code for health check"
+    required: false
+    default: "200"
+  health-check-retries:
+    description: "Number of health check retry attempts"
+    required: false
+    default: "3"
+  health-check-retry-delay:
+    description: "Delay between health check retries in milliseconds"
+    required: false
+    default: "5000"
+  health-check-fail-deploy:
+    description: "Fail the entire deployment if health check fails (true/false)"
+    required: false
+    default: "false"
+
+  # ── Notifications ──
+  webhook-url:
+    description: "Webhook URL for deployment notifications (Slack, Discord, or custom). Leave empty to skip."
+    required: false
+    default: ""
+  webhook-type:
+    description: "Webhook provider: slack, discord, or custom"
+    required: false
+    default: "slack"
+
+  # ── Environment ──
+  environment:
+    description: "Environment name (e.g., production, staging, development). Used in notifications and state tracking."
+    required: false
+    default: "production"
 
 outputs:
   files-uploaded:
@@ -83,6 +139,14 @@ outputs:
     description: "Total deployment duration in milliseconds"
   total-changes:
     description: "Total number of files changed (uploaded + replaced + deleted)"
+  rolled-back:
+    description: "Whether the deployment was rolled back (true/false)"
+  health-check-passed:
+    description: "Whether the health check passed (true/false/N/A)"
+  notification-sent:
+    description: "Whether the notification was sent successfully (true/false)"
+  environment:
+    description: "Environment name that was deployed to"
 
 runs:
   using: "node20"

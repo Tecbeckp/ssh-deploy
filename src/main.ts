@@ -31,19 +31,28 @@ function optionalLogLevel(name: string): "minimal" | "standard" | "verbose" {
   throw new Error(`Input "${name}" must be "minimal", "standard", or "verbose", got "${val}"`);
 }
 
+function optionalWebhookType(name: string): "slack" | "discord" | "custom" {
+  const val = core.getInput(name).toLowerCase();
+  if (val === "" || val === "slack") return "slack";
+  if (val === "discord" || val === "custom") return val;
+  throw new Error(`Input "${name}" must be "slack", "discord", or "custom", got "${val}"`);
+}
+
+function parseMultilineInput(name: string): string[] {
+  return core
+    .getMultilineInput(name)
+    .filter((line) => {
+      const trimmed = line.trim();
+      return trimmed !== "" && !trimmed.startsWith("#");
+    });
+}
+
 async function run(): Promise<void> {
   try {
     const exclude = core
       .getMultilineInput("exclude")
       .flatMap((line) => line.split(",").map((s) => s.trim()))
       .filter(Boolean);
-
-    const commands = core
-      .getMultilineInput("commands")
-      .filter((line) => {
-        const trimmed = line.trim();
-        return trimmed !== "" && !trimmed.startsWith("#");
-      });
 
     const args: DeployArguments = {
       host: core.getInput("host", { required: true }),
@@ -59,15 +68,25 @@ async function run(): Promise<void> {
       exclude,
       logLevel: optionalLogLevel("log-level"),
       timeout: optionalInt("timeout", 30000),
-      commands,
+      preCommands: parseMultilineInput("pre-commands"),
+      commands: parseMultilineInput("commands"),
       commandsWorkingDir: optionalString("commands-working-dir"),
+      rollbackOnFailure: optionalBool("rollback-on-failure", false),
+      rollbackLimit: optionalInt("rollback-limit", 3),
+      healthCheckUrl: optionalString("health-check-url"),
+      healthCheckExpectedStatus: optionalInt("health-check-status", 200),
+      healthCheckRetries: optionalInt("health-check-retries", 3),
+      healthCheckRetryDelay: optionalInt("health-check-retry-delay", 5000),
+      healthCheckFailDeploy: optionalBool("health-check-fail-deploy", false),
+      webhookUrl: optionalString("webhook-url"),
+      webhookType: optionalWebhookType("webhook-type"),
+      environment: core.getInput("environment") || "production",
     };
 
-    // Mask the private key in logs
+    // Mask secrets in logs
     core.setSecret(args.privateKey);
-    if (args.passphrase) {
-      core.setSecret(args.passphrase);
-    }
+    if (args.passphrase) core.setSecret(args.passphrase);
+    if (args.webhookUrl) core.setSecret(args.webhookUrl);
 
     const result = await deploy(args);
 
@@ -79,13 +98,24 @@ async function run(): Promise<void> {
     core.setOutput("bytes-transferred", result.bytesTransferred);
     core.setOutput("duration-ms", result.durationMs);
     core.setOutput("total-changes", result.filesUploaded + result.filesReplaced + result.filesDeleted);
+    core.setOutput("rolled-back", result.rolledBack);
+    core.setOutput("health-check-passed", result.healthCheck?.passed ?? "N/A");
+    core.setOutput("notification-sent", result.notificationSent);
+    core.setOutput("environment", result.environment);
 
-    // Check for failed commands
-    const failedCommands = result.commandResults.filter((r) => r.exitCode !== 0);
-    if (failedCommands.length > 0) {
-      core.warning(
-        `${failedCommands.length} post-deploy command(s) failed. Check logs for details.`
-      );
+    // Warnings
+    const failedPreCmds = result.preCommandResults.filter((r) => r.exitCode !== 0);
+    if (failedPreCmds.length > 0) {
+      core.warning(`${failedPreCmds.length} pre-deploy command(s) failed.`);
+    }
+
+    const failedPostCmds = result.commandResults.filter((r) => r.exitCode !== 0);
+    if (failedPostCmds.length > 0) {
+      core.warning(`${failedPostCmds.length} post-deploy command(s) failed.`);
+    }
+
+    if (result.rolledBack) {
+      core.warning("Deployment was rolled back due to health check failure.");
     }
   } catch (error: any) {
     core.setFailed(error.message);

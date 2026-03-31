@@ -1,5 +1,5 @@
 # ============================================================
-#  Sample GitHub Actions workflow using Tecbeckp/ssh-deploy
+#  Basic deployment workflow
 #  Place this file at: .github/workflows/deploy.yml
 # ============================================================
 
@@ -34,4 +34,10 @@ jobs:
 #    SSH_USERNAME      SSH user (e.g., root, deploy, ubuntu)
 #    SSH_PRIVATE_KEY   Full SSH private key content
 #                      Generate with: ssh-keygen -t ed25519
+#
+#  OPTIONAL SECRETS:
+#    SSH_PORT           SSH port (default: 22)
+#    SSH_PASSPHRASE     If your key is encrypted
+#    SLACK_WEBHOOK_URL  For Slack notifications
+#    DISCORD_WEBHOOK_URL For Discord notifications
 # ============================================================

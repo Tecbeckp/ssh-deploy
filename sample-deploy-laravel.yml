@@ -1,5 +1,5 @@
 # ============================================================
-#  Laravel / PHP deployment workflow
+#  Laravel / PHP deployment with all CI/CD features
 #  Place this file at: .github/workflows/deploy.yml
 # ============================================================
 
@@ -14,6 +14,7 @@ jobs:
   deploy:
     name: Deploy Laravel
     runs-on: ubuntu-latest
+    environment: production
 
     steps:
       - name: Checkout code
@@ -26,6 +27,7 @@ jobs:
           username: ${{ secrets.SSH_USERNAME }}
           private-key: ${{ secrets.SSH_PRIVATE_KEY }}
           server-dir: /var/www/html/my-laravel-app/
+          environment: production
           exclude: |
             **/.git*
             **/node_modules/**
@@ -35,6 +37,11 @@ jobs:
             **/storage/framework/cache/**
             **/storage/framework/sessions/**
             **/storage/framework/views/**
+          pre-commands: |
+            # Enable maintenance mode before deploying
+            php artisan down --secret="deploy-bypass-token"
+            # Create backup
+            mysqldump -u root mydb > /backups/db-$(date +%Y%m%d-%H%M%S).sql || true
           commands: |
             composer install --no-dev --optimize-autoloader
             php artisan migrate --force
@@ -42,4 +49,14 @@ jobs:
             php artisan route:cache
             php artisan view:cache
             php artisan queue:restart
+            # Disable maintenance mode
+            php artisan up
             sudo systemctl reload php8.3-fpm
+          rollback-on-failure: true
+          health-check-url: https://example.com/health
+          health-check-status: 200
+          health-check-retries: 5
+          health-check-retry-delay: 3000
+          health-check-fail-deploy: true
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: slack

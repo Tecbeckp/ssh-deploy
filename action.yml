@@ -59,6 +59,14 @@ inputs:
     description: "Connection/operation timeout in milliseconds"
     required: false
     default: "30000"
+  compression:
+    description: "Enable SSH compression (useful for slower networks)"
+    required: false
+    default: "false"
+  upload-concurrency:
+    description: "Number of concurrent file uploads (higher = faster but more resource usage)"
+    required: false
+    default: "5"
 
   # ── Pre-Deploy Commands ──
   pre-commands:

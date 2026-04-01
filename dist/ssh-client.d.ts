@@ -12,6 +12,8 @@ export declare class SSHClient {
         privateKey: string;
         passphrase?: string;
         timeout: number;
+        compression?: boolean;
+        uploadConcurrency?: number;
     }, logger: Logger);
     /** Establish SSH connection */
     connect(): Promise<void>;
@@ -26,6 +28,11 @@ export declare class SSHClient {
     writeFile(remotePath: string, content: string): Promise<void>;
     /** Upload a local file to remote path */
     uploadFile(localPath: string, remotePath: string): Promise<void>;
+    /** Upload multiple files in parallel */
+    uploadFilesParallel(files: Array<{
+        localPath: string;
+        remotePath: string;
+    }>, concurrency?: number): Promise<void>;
     /** Delete a remote file */
     deleteFile(remotePath: string): Promise<void>;
     /** Create remote directory recursively */

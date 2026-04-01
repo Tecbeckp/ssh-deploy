@@ -49265,6 +49265,8 @@ function applyDefaults(args) {
         webhookUrl: args.webhookUrl ?? "",
         webhookType: args.webhookType ?? "slack",
         environment: args.environment ?? "production",
+        compression: args.compression ?? false,
+        uploadConcurrency: args.uploadConcurrency ?? 5,
     };
 }
 /** Run a list of commands via SSH, returning results */
@@ -49397,6 +49399,12 @@ async function deploy(args) {
     //  STAGE 1: Connect
     // ══════════════════════════════════════════════════════════
     logger.stageBanner(1, TOTAL_STAGES, "\uD83D\uDD17", "Connecting to Server");
+    if (config.compression) {
+        logger.info("SSH compression enabled for slower networks");
+    }
+    if (config.uploadConcurrency > 1) {
+        logger.info(`Parallel uploads enabled (${config.uploadConcurrency} concurrent)`);
+    }
     const ssh = new ssh_client_1.SSHClient({
         host: config.host,
         port: config.port,
@@ -49404,6 +49412,8 @@ async function deploy(args) {
         privateKey: config.privateKey,
         passphrase: config.passphrase || undefined,
         timeout: config.timeout,
+        compression: config.compression,
+        uploadConcurrency: config.uploadConcurrency,
     }, logger);
     try {
         await ssh.connect();
@@ -49537,7 +49547,9 @@ async function deploy(args) {
         logger.stageBanner(7, TOTAL_STAGES, "\uD83D\uDCE4", "Syncing Files to Server");
         let bytesTransferred = 0;
         if (!config.dryRun) {
-            // Upload new files
+            // Collect all files to upload
+            const filesToUpload = [];
+            // Prepare new files
             if (diff.upload.length > 0) {
                 logger.minimal(`  \u2795 Uploading ${diff.upload.length} new file(s)...`);
                 for (const file of diff.upload) {
@@ -49545,20 +49557,29 @@ async function deploy(args) {
                     const remotePath = `${serverDir}${file.path}`;
                     const remoteDir = path.posix.dirname(remotePath);
                     await ssh.mkdirRecursive(remoteDir);
-                    await ssh.uploadFile(localPath, remotePath);
-                    bytesTransferred += file.size;
-                    logger.fileAdd(file.path, (0, hash_1.formatBytes)(file.size));
+                    filesToUpload.push({ file, type: "add", localPath, remotePath });
                 }
             }
-            // Replace modified files
+            // Prepare modified files
             if (diff.replace.length > 0) {
                 logger.minimal(`  \u270F\uFE0F  Replacing ${diff.replace.length} modified file(s)...`);
                 for (const file of diff.replace) {
                     const localPath = path.join(path.resolve(config.localDir), file.path);
                     const remotePath = `${serverDir}${file.path}`;
-                    await ssh.uploadFile(localPath, remotePath);
-                    bytesTransferred += file.size;
-                    logger.fileModify(file.path, (0, hash_1.formatBytes)(file.size));
+                    filesToUpload.push({ file, type: "modify", localPath, remotePath });
+                }
+            }
+            // Upload all files in parallel
+            if (filesToUpload.length > 0) {
+                await ssh.uploadFilesParallel(filesToUpload.map((f) => ({ localPath: f.localPath, remotePath: f.remotePath })), config.uploadConcurrency);
+                for (const item of filesToUpload) {
+                    bytesTransferred += item.file.size;
+                    if (item.type === "add") {
+                        logger.fileAdd(item.file.path, (0, hash_1.formatBytes)(item.file.size));
+                    }
+                    else {
+                        logger.fileModify(item.file.path, (0, hash_1.formatBytes)(item.file.size));
+                    }
                 }
             }
             // Delete removed files
@@ -50333,6 +50354,8 @@ async function run() {
             webhookUrl: optionalString("webhook-url"),
             webhookType: optionalWebhookType("webhook-type"),
             environment: core.getInput("environment") || "production",
+            compression: optionalBool("compression", false),
+            uploadConcurrency: optionalInt("upload-concurrency", 5),
         };
         // Mask secrets in logs
         core.setSecret(args.privateKey);
@@ -50644,7 +50667,11 @@ class SSHClient {
     config;
     constructor(config, logger) {
         this.client = new ssh2_1.Client();
-        this.config = config;
+        this.config = {
+            ...config,
+            compression: config.compression ?? false,
+            uploadConcurrency: config.uploadConcurrency ?? 5,
+        };
         this.logger = logger;
     }
     /** Establish SSH connection */
@@ -50662,14 +50689,21 @@ class SSHClient {
                 clearTimeout(timer);
                 reject(new Error(`SSH connection failed: ${err.message}`));
             });
-            this.client.connect({
+            const connectConfig = {
                 host: this.config.host,
                 port: this.config.port,
                 username: this.config.username,
                 privateKey: this.config.privateKey,
                 passphrase: this.config.passphrase,
                 readyTimeout: this.config.timeout,
-            });
+            };
+            // Add compression algorithms if enabled
+            if (this.config.compression) {
+                connectConfig.algorithms = {
+                    compress: ["zlib@openssh.com", "zlib"],
+                };
+            }
+            this.client.connect(connectConfig);
         });
     }
     /** Initialize SFTP subsystem */
@@ -50731,7 +50765,7 @@ class SSHClient {
     async uploadFile(localPath, remotePath) {
         const sftp = this.getSftp();
         return new Promise((resolve, reject) => {
-            sftp.fastPut(localPath, remotePath, (err) => {
+            sftp.fastPut(localPath, remotePath, { concurrency: 32 }, (err) => {
                 if (err) {
                     reject(new Error(`Failed to upload ${localPath} -> ${remotePath}: ${err.message}`));
                     return;
@@ -50739,6 +50773,20 @@ class SSHClient {
                 resolve();
             });
         });
+    }
+    /** Upload multiple files in parallel */
+    async uploadFilesParallel(files, concurrency = 5) {
+        const results = [];
+        for (let i = 0; i < files.length; i += concurrency) {
+            const batch = files.slice(i, i + concurrency);
+            const batchPromises = batch.map((file) => this.uploadFile(file.localPath, file.remotePath));
+            const batchResults = await Promise.allSettled(batchPromises);
+            for (const result of batchResults) {
+                if (result.status === "rejected") {
+                    throw result.reason;
+                }
+            }
+        }
     }
     /** Delete a remote file */
     async deleteFile(remotePath) {

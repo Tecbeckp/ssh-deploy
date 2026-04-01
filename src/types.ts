@@ -25,6 +25,10 @@ export interface DeployArguments {
   logLevel: "minimal" | "standard" | "verbose";
   /** Connection/operation timeout in milliseconds (default: 30000) */
   timeout: number;
+  /** Enable SSH compression for slower networks (default: false) */
+  compression: boolean;
+  /** Max concurrent file uploads (default: 5) */
+  uploadConcurrency: number;
   /** Commands to execute on server BEFORE file sync */
   preCommands: string[];
   /** Commands to execute on server AFTER file sync */

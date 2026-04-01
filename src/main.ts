@@ -81,6 +81,8 @@ async function run(): Promise<void> {
       webhookUrl: optionalString("webhook-url"),
       webhookType: optionalWebhookType("webhook-type"),
       environment: core.getInput("environment") || "production",
+      compression: optionalBool("compression", false),
+      uploadConcurrency: optionalInt("upload-concurrency", 5),
     };
 
     // Mask secrets in logs

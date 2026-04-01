@@ -14,6 +14,8 @@ export class SSHClient {
     privateKey: string;
     passphrase?: string;
     timeout: number;
+    compression: boolean;
+    uploadConcurrency: number;
   };
 
   constructor(
@@ -24,11 +26,17 @@ export class SSHClient {
       privateKey: string;
       passphrase?: string;
       timeout: number;
+      compression?: boolean;
+      uploadConcurrency?: number;
     },
     logger: Logger
   ) {
     this.client = new Client();
-    this.config = config;
+    this.config = {
+      ...config,
+      compression: config.compression ?? false,
+      uploadConcurrency: config.uploadConcurrency ?? 5,
+    };
     this.logger = logger;
   }
 
@@ -50,14 +58,23 @@ export class SSHClient {
         reject(new Error(`SSH connection failed: ${err.message}`));
       });
 
-      this.client.connect({
+      const connectConfig: any = {
         host: this.config.host,
         port: this.config.port,
         username: this.config.username,
         privateKey: this.config.privateKey,
         passphrase: this.config.passphrase,
         readyTimeout: this.config.timeout,
-      });
+      };
+
+      // Add compression algorithms if enabled
+      if (this.config.compression) {
+        connectConfig.algorithms = {
+          compress: ["zlib@openssh.com", "zlib"],
+        };
+      }
+
+      this.client.connect(connectConfig);
     });
   }
 
@@ -125,7 +142,7 @@ export class SSHClient {
   async uploadFile(localPath: string, remotePath: string): Promise<void> {
     const sftp = this.getSftp();
     return new Promise((resolve, reject) => {
-      sftp.fastPut(localPath, remotePath, (err) => {
+      sftp.fastPut(localPath, remotePath, { concurrency: 32 }, (err) => {
         if (err) {
           reject(new Error(`Failed to upload ${localPath} -> ${remotePath}: ${err.message}`));
           return;
@@ -133,6 +150,26 @@ export class SSHClient {
         resolve();
       });
     });
+  }
+
+  /** Upload multiple files in parallel */
+  async uploadFilesParallel(
+    files: Array<{ localPath: string; remotePath: string }>,
+    concurrency: number = 5
+  ): Promise<void> {
+    const results: Promise<void>[] = [];
+
+    for (let i = 0; i < files.length; i += concurrency) {
+      const batch = files.slice(i, i + concurrency);
+      const batchPromises = batch.map((file) => this.uploadFile(file.localPath, file.remotePath));
+      const batchResults = await Promise.allSettled(batchPromises);
+
+      for (const result of batchResults) {
+        if (result.status === "rejected") {
+          throw result.reason;
+        }
+      }
+    }
   }
 
   /** Delete a remote file */
